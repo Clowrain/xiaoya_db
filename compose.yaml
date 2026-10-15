@@ -1,0 +1,42 @@
+services:
+  xiaoya-emd:
+    image: "${XIAOYA_EMD_IMAGE:?Set XIAOYA_EMD_IMAGE in .env}"
+    container_name: xiaoya-emd
+    restart: always
+    network_mode: host
+    privileged: false
+    volumes:
+      - type: bind
+        source: /vol1/@appdata/media/xiaoya
+        target: /media
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${XIAOYA_DATA_DIR:-/vol1/1000/xiaoya}"
+        target: /xiaoya-data
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      TZ: Asia/Shanghai
+      CYCLE: "43200"
+      RESTART_AUTO_UPDATE: "false"
+      EMBY_REFRESH_ENABLED: "${EMBY_REFRESH_ENABLED:-true}"
+      EMBY_URL: "${EMBY_URL:-http://127.0.0.1:2345/emby}"
+      EMBY_API_KEY_FILE: /xiaoya-data/infuse_api_key.txt
+      HTTP_PROXY: "${XIAOYA_PROXY_URL:?Set XIAOYA_PROXY_URL in .env}"
+      HTTPS_PROXY: "${XIAOYA_PROXY_URL:?Set XIAOYA_PROXY_URL in .env}"
+      http_proxy: "${XIAOYA_PROXY_URL:?Set XIAOYA_PROXY_URL in .env}"
+      https_proxy: "${XIAOYA_PROXY_URL:?Set XIAOYA_PROXY_URL in .env}"
+      NO_PROXY: "localhost,127.0.0.1,::1"
+      no_proxy: "localhost,127.0.0.1,::1"
+    command:
+      - --media
+      - /media
+      - --paths
+      - /media/pathlib.txt
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"

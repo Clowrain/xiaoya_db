@@ -8,6 +8,7 @@ from urllib.parse import urljoin, urlparse, unquote, quote
 import aiohttp.client_exceptions
 from bs4 import BeautifulSoup
 from datetime import datetime
+from dataclasses import dataclass
 import random
 import re
 import gzip
@@ -19,6 +20,7 @@ import aiohttp
 from aiohttp import ClientSession, TCPConnector
 import aiosqlite
 import aiofiles.os as aio_os
+from emby_refresh import refresh_emby_after_sync
 
 
 logging.basicConfig(
@@ -62,6 +64,13 @@ s_paths = [
 ]
 
 s_pool = []
+
+
+@dataclass
+class SyncStats:
+    downloaded: int = 0
+    errors: int = 0
+
 
 def fetch_pool_from_url(url="https://img.xiaoya.pro/crawlerlist.txt"):
     """Fetch server pool list from remote URL"""
@@ -207,11 +216,13 @@ async def fetch_html(url, session, **kwargs) -> str:
 
 
 async def parse(url, session, **kwargs) -> set:
+    stats = kwargs.get("stats", SyncStats())
     files = []
     directories = []
     try:
         html = await fetch_html(url=url, session=session, **kwargs)
         if html is None:
+            stats.errors += 1
             logger.debug("Failed to fetch HTML content for URL: %s", unquote(url))
             return files, directories
     except (
@@ -220,6 +231,7 @@ async def parse(url, session, **kwargs) -> set:
         aiohttp.ClientPayloadError,
         aiohttp.ClientResponseError,
     ) as e:
+        stats.errors += 1
         logger.error(
             "aiohttp exception for %s [%s]: %s",
             unquote(url),
@@ -228,6 +240,7 @@ async def parse(url, session, **kwargs) -> set:
         )
         return files, directories
     except Exception as e:
+        stats.errors += 1
         logger.exception(
             "Non-aiohttp exception occurred:  %s", getattr(e, "__dict__", {})
         )
@@ -252,9 +265,11 @@ async def parse(url, session, **kwargs) -> set:
                 filesize = link.next_sibling.strip().split()[2]
                 files.append((abslink, filename, timestamp_unix, filesize))
             except (urllib.error.URLError, ValueError):
+                stats.errors += 1
                 logger.exception("Error parsing URL: %s", unquote(link))
                 continue
             except Exception as e:
+                stats.errors += 1
                 logger.exception("Unexpected error: %s", e)
                 continue
         elif href != "../" and not href.lower().endswith(".txt"):
@@ -288,6 +303,7 @@ async def need_download(file, **kwargs):
 
 
 async def download(file, session, **kwargs):
+    stats = kwargs.get("stats", SyncStats())
     url, filename, timestamp, filesize = file
     semaphore = kwargs["semaphore"]
     async with semaphore:
@@ -302,14 +318,17 @@ async def download(file, session, **kwargs):
                         await f.write(await response.content.read())
                         logger.debug("Finish to write file: %s", filename)
                     os.chmod(file_path, 0o777)
+                    stats.downloaded += 1
                     logger.info("Downloaded: %s", filename)
                 else:
+                    stats.errors += 1
                     logger.error(
                         "Failed to download: %s [Response code: %s]",
                         filename,
                         response.status,
                     )
         except Exception as e:
+            stats.errors += 1
             logger.exception("Download exception: %s", e)
 
 
@@ -731,9 +750,11 @@ async def main():
         db_session = await aiosqlite.connect(tempdb)
         await create_table(db_session)
     logger.info("Crawling slowly...")
+    stats = SyncStats()
     async with ClientSession(
         connector=TCPConnector(ssl=False, limit=0, ttl_dns_cache=600),
         timeout=aiohttp.ClientTimeout(total=36000),
+        trust_env=True,
     ) as session:
         await bulk_crawl_and_write(
             url=url,
@@ -743,6 +764,7 @@ async def main():
             media=media,
             nfo=args.nfo,
             paths=paths,
+            stats=stats,
         )
     if db_session:
         await db_session.commit()
@@ -755,6 +777,9 @@ async def main():
             os.rename(tempdb, localdb)
         else:
             os.remove(tempdb)
+    logger.info("Sync finished: %d downloaded files, %d errors", stats.downloaded, stats.errors)
+    if not await refresh_emby_after_sync(stats.downloaded, stats.errors):
+        logger.warning("Metadata sync completed, but Emby refresh was not fully successful")
     logger.info("Finished...")
 
 

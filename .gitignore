@@ -8,3 +8,6 @@ media/*
 debug*
 dev.py
 archive
+.env
+.env.*
+!.env.example
