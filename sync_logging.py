@@ -15,7 +15,7 @@ from aiohttp.helpers import get_env_proxy_for_url
 from yarl import URL
 
 
-APP_VERSION = "1.6.2-clowrain"
+APP_VERSION = "1.6.3-clowrain"
 logger = logging.getLogger("emd")
 
 

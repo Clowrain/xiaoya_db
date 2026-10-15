@@ -300,33 +300,47 @@ async def download(file, session, **kwargs):
     stats = kwargs.get("stats", SyncStats())
     url, filename, timestamp, filesize = file
     semaphore = kwargs["semaphore"]
+    max_attempts = kwargs.get("download_max_attempts", 3)
+    retry_delay = kwargs.get("download_retry_delay", 10)
     async with semaphore:
-        try:
-            async with tracked_request(session, url, stats, "下载") as response:
-                if response.status == 200:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with tracked_request(session, url, stats, "下载") as response:
+                    if response.status != 200:
+                        raise aiohttp.ClientResponseError(
+                            response.request_info, response.history, status=response.status,
+                        )
+                    # Receive the whole body before opening the destination. A broken
+                    # proxy connection must not truncate the existing file between retries.
+                    content = await response.content.read()
                     file_path = os.path.join(kwargs["media"], filename.lstrip("/"))
                     os.umask(0)
                     os.makedirs(os.path.dirname(file_path), mode=0o777, exist_ok=True)
                     async with aiofiles.open(file_path, "wb") as f:
                         logger.debug("Starting to write file: %s", filename)
-                        await f.write(await response.content.read())
+                        await f.write(content)
                         logger.debug("Finish to write file: %s", filename)
                     os.chmod(file_path, 0o777)
-                    stats.downloaded += 1
-                    logger.info("Downloaded: %s", filename)
+                stats.downloaded += 1
+                if attempt > 1:
+                    logger.info("重试下载成功（第 %d/%d 次）：%s", attempt, max_attempts, filename)
                 else:
+                    logger.info("Downloaded: %s", filename)
+                return
+            except Exception as error:
+                details = (
+                    f"{safe_url(url)} | {type(error).__name__} | "
+                    f"HTTP={getattr(error, 'status', 'n/a')} | errno={getattr(error, 'errno', 'n/a')}"
+                )
+                if attempt == max_attempts:
                     stats.errors += 1
-                    logger.error(
-                        "Failed to download: %s [Response code: %s]",
-                        filename,
-                        response.status,
-                    )
-        except Exception as e:
-            stats.errors += 1
-            logger.error(
-                "文件下载失败：%s | %s | HTTP=%s | errno=%s",
-                safe_url(url), type(e).__name__, getattr(e, "status", "n/a"), getattr(e, "errno", "n/a"),
-            )
+                    logger.error("文件下载失败：%s | 已达最大尝试次数 %d，放弃该文件", details, max_attempts)
+                    return
+                logger.warning(
+                    "文件下载暂时失败（第 %d/%d 次）：%s | 等待 %g 秒后重试",
+                    attempt, max_attempts, details, retry_delay,
+                )
+            await asyncio.sleep(retry_delay)
 
 
 async def download_files(files, session, **kwargs):
@@ -663,9 +677,14 @@ async def main():
     try:
         timeout = crawler_timeout()
         progress_interval = positive_env("PROGRESS_INTERVAL", 15)
+        download_max_attempts = int(os.getenv("DOWNLOAD_MAX_ATTEMPTS", "3"))
+        if download_max_attempts <= 0:
+            raise ValueError("DOWNLOAD_MAX_ATTEMPTS 必须为正整数")
+        download_retry_delay = positive_env("DOWNLOAD_RETRY_DELAY", 10)
     except ValueError as error:
         parser.error(str(error))
     log_startup(timeout, progress_interval)
+    logger.info("下载重试：每个文件最多尝试 %d 次（含首次），失败后等待 %g 秒", download_max_attempts, download_retry_delay)
 
     # Fetch server pool dynamically
     global s_pool
@@ -791,6 +810,8 @@ async def main():
                 nfo=args.nfo,
                 paths=paths,
                 stats=stats,
+                download_max_attempts=download_max_attempts,
+                download_retry_delay=download_retry_delay,
             )
         finally:
             progress.cancel()

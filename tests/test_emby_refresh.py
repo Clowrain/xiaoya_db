@@ -27,6 +27,8 @@ class EmbyRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.failed_ids = set()
         self.failed_directory = False
         self.failed_download = False
+        self.download_failures_before_success = None
+        self.failed_download_attempts = 0
         self.expect_sync_finished = False
         app = web.Application()
         app.router.add_get("/emby/Library/VirtualFolders", self.list_libraries)
@@ -45,6 +47,7 @@ class EmbyRefreshTests(unittest.IsolatedAsyncioTestCase):
             "HTTP_PROXY": "http://127.0.0.1:1",
             "HTTPS_PROXY": "http://127.0.0.1:1",
             "NO_PROXY": "",
+            "DOWNLOAD_RETRY_DELAY": "0.001",
         }, clear=True)
         self.environment.start()
 
@@ -84,6 +87,9 @@ class EmbyRefreshTests(unittest.IsolatedAsyncioTestCase):
         if request.path == "/每日更新/sample.nfo":
             return web.Response(body=b"test")
         if request.path == "/每日更新/failed.jpg":
+            self.failed_download_attempts += 1
+            if self.download_failures_before_success is not None and self.failed_download_attempts > self.download_failures_before_success:
+                return web.Response(body=b"test")
             return web.Response(status=503)
         if self.failed_directory and request.path == "/综艺/":
             return web.Response(status=500)
@@ -196,6 +202,14 @@ class EmbyRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.media / "每日更新/sample.nfo").read_bytes(), b"test")
         self.assertFalse((self.media / "每日更新/failed.jpg").exists())
         self.assertEqual(self.calls, [])
+
+    async def test_recovered_download_failure_allows_emby_refresh(self):
+        self.failed_download = True
+        self.download_failures_before_success = 2
+        await self.run_sync()
+        self.assertEqual(self.failed_download_attempts, 3)
+        self.assertEqual((self.media / "每日更新/failed.jpg").read_bytes(), b"test")
+        self.assertEqual(len(self.calls), 7)
 
 
 if __name__ == "__main__":
