@@ -3,7 +3,7 @@
 # shellcheck disable=SC2068
 # shellcheck disable=SC2114
 
-IMAGE_VERSION=v1.0.2
+IMAGE_VERSION=v1.1.0
 
 Green="\033[32m"
 Red="\033[31m"
@@ -82,14 +82,18 @@ function main_solid() {
         touch /media/solid.lock
         INFO "开始下载同步！"
         INFO "python3 solid.py $*"
-        python3 solid.py $@
-        INFO "运行完成！"
+        if python3 solid.py "$@"; then
+            INFO "本轮同步正常结束！"
+        else
+            result=$?
+            ERROR "本轮同步失败，程序退出码：${result}，请查看上方错误日志！"
+        fi
         rm -f /media/solid.lock
     fi
 
 }
 
-INFO "镜像脚本版本：${IMAGE_VERSION}"
+INFO "镜像脚本版本：${IMAGE_VERSION} | 构建提交：${XIAOYA_BUILD_REVISION:-local} | 构建时间：${XIAOYA_BUILD_DATE:-unknown}"
 
 if [ "${IMG_VOLUME}" == "true" ]; then
     mount_img
@@ -107,7 +111,7 @@ else
             update_app
             INFO "更新成功！"
         fi
-        main_solid $@
+        main_solid "$@"
         INFO "等待${CYCLE}秒后下次运行！"
         sleep "${CYCLE}"
     done

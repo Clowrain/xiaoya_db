@@ -33,10 +33,16 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip && \
         /root/.cache \
         /tmp/*
 
-COPY solid.py emby_refresh.py /app/
+COPY solid.py emby_refresh.py sync_logging.py /app/
 
 COPY ./pkg/docker/entrypoint.sh /entrypoint.sh
 RUN chmod 755 /entrypoint.sh
+
+ARG VCS_REF=local
+ARG BUILD_DATE=unknown
+ENV XIAOYA_BUILD_REVISION=${VCS_REF} \
+    XIAOYA_BUILD_DATE=${BUILD_DATE} \
+    PYTHONUNBUFFERED=1
 
 ENTRYPOINT ["tini", "-g", "--", "/entrypoint.sh"]
 

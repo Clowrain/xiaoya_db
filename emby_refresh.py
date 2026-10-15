@@ -23,12 +23,13 @@ DEFAULT_LIBRARY_NAMES = [
 async def refresh_emby_after_sync(downloaded, errors=0):
     """Return false on refresh failure; never undo a completed metadata sync."""
     if os.getenv("EMBY_REFRESH_ENABLED", "false").lower() not in ("true", "1", "yes"):
+        logger.info("Emby 自动刷新未启用")
         return True
     if errors:
-        logger.warning("Skipping Emby refresh: sync encountered %d errors", errors)
+        logger.warning("跳过 Emby 刷新：本轮同步存在 %d 个操作错误", errors)
         return True
     if not downloaded:
-        logger.info("Skipping Emby refresh: no files were downloaded")
+        logger.info("跳过 Emby 刷新：本轮没有新文件下载")
         return True
 
     try:
@@ -37,7 +38,7 @@ async def refresh_emby_after_sync(downloaded, errors=0):
             async with aiofiles.open(os.environ["EMBY_API_KEY_FILE"], encoding="utf-8") as file:
                 api_key = (await file.read()).strip()
         if not api_key:
-            logger.error("Emby refresh requires EMBY_API_KEY or EMBY_API_KEY_FILE")
+            logger.error("Emby 刷新缺少密钥：请配置 EMBY_API_KEY 或 EMBY_API_KEY_FILE")
             return False
 
         names = json.loads(os.getenv("EMBY_LIBRARY_NAMES", json.dumps(DEFAULT_LIBRARY_NAMES)))
@@ -89,13 +90,13 @@ async def refresh_emby_after_sync(downloaded, errors=0):
                         response.raise_for_status()
                         await response.read()
                     accepted += 1
-                    logger.info("Emby refresh request accepted: %s (ID: %s)", library["Name"], item_id)
+                    logger.info("已提交 Emby 刷新：%s（ID：%s）", library["Name"], item_id)
                 except (ClientError, asyncio.TimeoutError) as error:
                     logger.error(
                         "Emby refresh failed for %s: %s (HTTP %s)",
                         library["Name"], type(error).__name__, getattr(error, "status", "n/a"),
                     )
-            logger.info("Emby accepted %d/%d refresh requests; scans run asynchronously", accepted, len(selected))
+            logger.info("Emby 已接受 %d/%d 个刷新请求，媒体库扫描由 Emby 后台执行", accepted, len(selected))
             return accepted == len(selected) and not missing
     except (ClientError, asyncio.TimeoutError, OSError, ValueError) as error:
         # Avoid logging URLs, headers or response bodies containing credentials.

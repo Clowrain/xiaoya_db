@@ -8,10 +8,11 @@ from urllib.parse import urljoin, urlparse, unquote, quote
 import aiohttp.client_exceptions
 from bs4 import BeautifulSoup
 from datetime import datetime
-from dataclasses import dataclass
+from contextlib import suppress
 import random
 import re
 import gzip
+import shutil
 
 
 import asyncio
@@ -21,6 +22,10 @@ from aiohttp import ClientSession, TCPConnector
 import aiosqlite
 import aiofiles.os as aio_os
 from emby_refresh import refresh_emby_after_sync
+from sync_logging import (
+    SyncStats, crawler_timeout, log_startup, log_proxy_route,
+    positive_env, report_progress, log_progress, safe_url, tracked_request,
+)
 
 
 logging.basicConfig(
@@ -66,15 +71,10 @@ s_paths = [
 s_pool = []
 
 
-@dataclass
-class SyncStats:
-    downloaded: int = 0
-    errors: int = 0
-
-
 def fetch_pool_from_url(url="https://img.xiaoya.pro/crawlerlist.txt"):
     """Fetch server pool list from remote URL"""
     try:
+        log_proxy_route(url)
         logger.info("Fetching server pool from %s", url)
         response = urllib.request.urlopen(url, timeout=10)
         if response.getcode() == 200:
@@ -150,8 +150,9 @@ def pick_a_pool_member(url_list):
     random.shuffle(url_list)
     for member in url_list:
         try:
-            logger.debug("Testing: %s", member)
-            response = urllib.request.urlopen(member)
+            logger.info("探测镜像：%s（超时15秒）", safe_url(member))
+            log_proxy_route(member)
+            response = urllib.request.urlopen(member, timeout=15)
             if response.getcode() == 200:
                 content = response.read()
                 try:
@@ -171,7 +172,10 @@ def pick_a_pool_member(url_list):
 def current_amount(url, media, paths):
     listfile = os.path.join(media, ".scan.list.gz")
     try:
-        res = urllib.request.urlretrieve(url, listfile)
+        logger.info("正在下载远端文件清单：%s", safe_url(url))
+        with urllib.request.urlopen(url, timeout=30) as response, open(listfile, "wb") as output:
+            shutil.copyfileobj(response, output)
+        logger.info("正在统计所选目录的远端文件数量")
         with gzip.open(listfile) as response:
             pattern = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} \/(.*)$"
             hidden_pattern = r"^.*?\/\..*$"
@@ -190,23 +194,18 @@ def current_amount(url, media, paths):
                 except:
                     logger.error("Error decoding line: %s", line)
         return matching_lines
-    except urllib.error.URLError as e:
-        print("Error:", e)
+    except (urllib.error.URLError, OSError, EOFError) as e:
+        logger.error("远端清单读取失败：%s | %s", safe_url(url), type(e).__name__)
         return -1
 
 
 async def fetch_html(url, session, **kwargs) -> str:
     semaphore = kwargs["semaphore"]
+    stats = kwargs.get("stats", SyncStats())
     async with semaphore:
-        async with session.request(method="GET", url=url) as resp:
-            logger.debug(
-                "Request Headers for [%s]: [%s]",
-                unquote(url),
-                resp.request_info.headers,
-            )
+        async with tracked_request(session, url, stats, "目录") as resp:
             resp.raise_for_status()
-            logger.debug("Response Headers for [%s]: [%s]", unquote(url), resp.headers)
-            logger.debug("Got response [%s] for URL: %s", resp.status, unquote(url))
+            logger.debug("目录响应：HTTP %s %s", resp.status, safe_url(url))
             try:
                 text = await resp.text()
                 return text
@@ -232,18 +231,11 @@ async def parse(url, session, **kwargs) -> set:
         aiohttp.ClientResponseError,
     ) as e:
         stats.errors += 1
-        logger.error(
-            "aiohttp exception for %s [%s]: %s",
-            unquote(url),
-            getattr(e, "status", None),
-            getattr(e, "message", None),
-        )
+        logger.error("目录请求失败：%s | %s | HTTP=%s", safe_url(url), type(e).__name__, getattr(e, "status", "n/a"))
         return files, directories
     except Exception as e:
         stats.errors += 1
-        logger.exception(
-            "Non-aiohttp exception occurred:  %s", getattr(e, "__dict__", {})
-        )
+        logger.error("目录请求失败：%s | %s", safe_url(url), type(e).__name__)
         return files, directories
 
     soup = BeautifulSoup(html, "html.parser")
@@ -274,6 +266,8 @@ async def parse(url, session, **kwargs) -> set:
                 continue
         elif href != "../" and not href.lower().endswith(".txt"):
             directories.append(urljoin(url, href))
+    stats.directories += 1
+    stats.files += len(files)
     return files, directories
 
 
@@ -308,7 +302,7 @@ async def download(file, session, **kwargs):
     semaphore = kwargs["semaphore"]
     async with semaphore:
         try:
-            async with session.get(url) as response:
+            async with tracked_request(session, url, stats, "下载") as response:
                 if response.status == 200:
                     file_path = os.path.join(kwargs["media"], filename.lstrip("/"))
                     os.umask(0)
@@ -329,18 +323,26 @@ async def download(file, session, **kwargs):
                     )
         except Exception as e:
             stats.errors += 1
-            logger.exception("Download exception: %s", e)
+            logger.error(
+                "文件下载失败：%s | %s | HTTP=%s | errno=%s",
+                safe_url(url), type(e).__name__, getattr(e, "status", "n/a"), getattr(e, "errno", "n/a"),
+            )
 
 
 async def download_files(files, session, **kwargs):
+    stats = kwargs.get("stats", SyncStats())
     download_tasks = set()
-    for file in files:
+    for index, file in enumerate(files):
+        if index and index % 1000 == 0:
+            await asyncio.sleep(0)
         if await need_download(file, **kwargs) is True:
             task = asyncio.create_task(download(file, session, **kwargs))
             task.add_done_callback(download_tasks.discard)
             download_tasks.add(task)
             if len(download_tasks) > 100:
                 await asyncio.gather(*download_tasks)
+        else:
+            stats.unchanged += 1
     await asyncio.gather(*download_tasks)
 
 
@@ -453,6 +455,8 @@ async def bulk_crawl_and_write(url, session, db_session, depth=0, **kwargs) -> N
         url=url, session=session, db_session=db_session, **kwargs
     )
     for url in directories:
+        if depth == 0:
+            logger.info("开始扫描所选目录：%s", safe_url(url))
         task = asyncio.create_task(
             bulk_crawl_and_write(
                 url=url,
@@ -466,10 +470,11 @@ async def bulk_crawl_and_write(url, session, db_session, depth=0, **kwargs) -> N
         tasks.add(task)
         if depth == 0:
             await asyncio.gather(*tasks)
+            logger.info("所选目录扫描结束：%s", safe_url(url))
     await asyncio.gather(*tasks)
 
 
-async def compare_databases(localdb, tempdb, total_amount):
+async def compare_databases(localdb, tempdb, total_amount, stats=None):
     async with aiosqlite.connect(localdb) as conn1, aiosqlite.connect(tempdb) as conn2:
         cursor1 = await conn1.cursor()
         cursor2 = await conn2.cursor()
@@ -482,9 +487,11 @@ async def compare_databases(localdb, tempdb, total_amount):
         gap = abs(len(temp_filenames) - total_amount)
 
         if gap < 10 and total_amount > 0:
+            if stats is not None:
+                stats.purge_status = "校验通过"
             if not gap == 0:
                 logger.warning(
-                    "Total amount do not match: %d -> %d. But the gap %d is less than 10, purging anyway...",
+                    "远端清单有小幅差异：清单=%d，实际扫描=%d，绝对差值=%d（小于10）；按原有阈值继续清理",
                     total_amount,
                     len(temp_filenames),
                     abs(len(temp_filenames) - total_amount),
@@ -492,21 +499,29 @@ async def compare_databases(localdb, tempdb, total_amount):
             diff_filenames = local_filenames - temp_filenames
             return diff_filenames
         else:
-            logger.error(
-                "Total amount do not match: %d -> %d. Purges are skipped",
-                total_amount,
-                len(temp_filenames),
+            if stats is not None:
+                stats.purge_status = f"已跳过（清单差值{len(temp_filenames) - total_amount:+d}）"
+            logger.warning(
+                "远端清单校验不一致：清单=%d，实际扫描=%d，差值=%+d；为避免误删，本轮跳过过期文件清理",
+                total_amount, len(temp_filenames), len(temp_filenames) - total_amount,
             )
             return []
 
 
-async def purge_removed_files(localdb, tempdb, media, total_amount):
-    for file in await compare_databases(localdb, tempdb, total_amount):
-        logger.info("Purged %s", file)
+async def purge_removed_files(localdb, tempdb, media, total_amount, stats=None):
+    for file in await compare_databases(localdb, tempdb, total_amount, stats=stats):
         try:
             os.remove(media + file)
+            logger.info("已删除过期文件：%s", file)
+            if stats is not None:
+                stats.deleted += 1
         except Exception as e:
+            if stats is not None:
+                stats.errors += 1
+                stats.purge_status = "部分删除失败"
             logger.error("Unable to remove %s due to %s", file, e)
+    if stats is not None and stats.purge_status == "校验通过":
+        stats.purge_status = "已完成"
 
 
 def test_media_folder(media, paths):
@@ -641,9 +656,16 @@ async def main():
     )
 
     args = parser.parse_args()
+    if args.count <= 0:
+        parser.error("--count 必须为正整数")
     if args.debug:
         logging.getLogger("emd").setLevel(logging.DEBUG)
-    logging.info("*** xiaoya_emd version 1.6.1 ***")
+    try:
+        timeout = crawler_timeout()
+        progress_interval = positive_env("PROGRESS_INTERVAL", 15)
+    except ValueError as error:
+        parser.error(str(error))
+    log_startup(timeout, progress_interval)
 
     # Fetch server pool dynamically
     global s_pool
@@ -705,17 +727,20 @@ async def main():
         url = pick_a_pool_member(s_pool)
     else:
         url = args.url
-    if urlparse(url).path != "/" and (args.purge or args.db):
-        logger.warning("--db or --purge only support in root path mode")
-        sys.exit(1)
     if not url:
         logger.info(
             "No servers are reachable, please check your Internet connection..."
         )
         sys.exit(1)
+    if urlparse(url).path != "/" and (args.purge or args.db):
+        logger.warning("--db or --purge only support in root path mode")
+        sys.exit(1)
+    stats = SyncStats()
     if urlparse(url).path == "/":
         total_amount = current_amount(url + ".scan.list.gz", media, paths)
-        logger.info("There are %d files in %s", total_amount, url)
+        if total_amount < 0:
+            stats.errors += 1
+        logger.info("远端清单统计：所选范围共 %d 个文件 | %s", total_amount, safe_url(url))
     semaphore = asyncio.Semaphore(args.count)
     db_session = None
     if args.db or args.purge:
@@ -749,38 +774,48 @@ async def main():
 
         db_session = await aiosqlite.connect(tempdb)
         await create_table(db_session)
-    logger.info("Crawling slowly...")
-    stats = SyncStats()
+    logger.info("开始扫描：最大并发请求=%d；无文件需要更新时也会定时输出进度", args.count)
     async with ClientSession(
         connector=TCPConnector(ssl=False, limit=0, ttl_dns_cache=600),
-        timeout=aiohttp.ClientTimeout(total=36000),
+        timeout=timeout,
         trust_env=True,
     ) as session:
-        await bulk_crawl_and_write(
-            url=url,
-            session=session,
-            db_session=db_session,
-            semaphore=semaphore,
-            media=media,
-            nfo=args.nfo,
-            paths=paths,
-            stats=stats,
-        )
+        progress = asyncio.create_task(report_progress(stats, progress_interval))
+        try:
+            await bulk_crawl_and_write(
+                url=url,
+                session=session,
+                db_session=db_session,
+                semaphore=semaphore,
+                media=media,
+                nfo=args.nfo,
+                paths=paths,
+                stats=stats,
+            )
+        finally:
+            progress.cancel()
+            with suppress(asyncio.CancelledError):
+                await progress
+    log_progress(stats)
+    logger.info("扫描完成，正在收尾")
     if db_session:
         await db_session.commit()
         await db_session.close()
     if args.purge:
-        await purge_removed_files(localdb, tempdb, media, total_amount)
+        await purge_removed_files(localdb, tempdb, media, total_amount, stats=stats)
         remove_empty_folders(paths, media)
         os.remove(localdb)
         if not args.all:
             os.rename(tempdb, localdb)
         else:
             os.remove(tempdb)
-    logger.info("Sync finished: %d downloaded files, %d errors", stats.downloaded, stats.errors)
+    logger.info(
+        "同步汇总：扫描文件=%d，下载成功=%d，无需下载=%d，操作错误=%d，过期清理=%s，删除文件=%d",
+        stats.files, stats.downloaded, stats.unchanged, stats.errors, stats.purge_status, stats.deleted,
+    )
     if not await refresh_emby_after_sync(stats.downloaded, stats.errors):
-        logger.warning("Metadata sync completed, but Emby refresh was not fully successful")
-    logger.info("Finished...")
+        logger.warning("元数据同步已结束，但 Emby 刷新未全部成功，请查看上方刷新错误")
+    logger.info("本轮同步流程结束")
 
 
 if __name__ == "__main__":

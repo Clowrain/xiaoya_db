@@ -148,9 +148,32 @@ EMBY_LIBRARY_NAMES: '["电影/每日更新", "电视剧/每日更新"]'
 默认 Compose 只传入 `EMBY_API_KEY_FILE`，确保每轮从文件读取当前密钥。
 设置 `EMBY_REFRESH_ENABLED=false` 可关闭自动刷新。
 
-容器构建会从当前构建目录复制 `solid.py`、`emby_refresh.py` 和 `requirements.txt`，
+容器构建会从当前构建目录复制 `solid.py`、`emby_refresh.py`、`sync_logging.py` 和 `requirements.txt`，
 使本地修改进入镜像。自动更新的默认仓库为 `Clowrain/xiaoya_db`，
 可以通过构建参数 `REPO_URL`、`BRANCH` 调整；自用版本建议保持 `RESTART_AUTO_UPDATE=false`。
+
+## 查看版本、进度与代理路由
+
+启动日志会显示程序版本、构建提交、构建时间和隐藏账号密码后的代理地址。
+每个目标主机首次请求时，会显示是否连接 HTTP 代理，或因 `NO_PROXY` 等原因选择 `DIRECT`。
+连接到 Mihomo 后，最终出站节点仍由 Mihomo 的规则决定，需要从其连接记录核对。
+
+扫描期间默认每 15 秒输出一次目录数、已发现文件数、下载数、无需下载数、错误数、
+进行中的请求数量，以及当前最久请求的地址和耗时，便于区分等待网络与正常扫描。
+同步结束后单独报告过期清理状态：远端清单与扫描数量不一致而跳过清理时，
+会明确显示差值，不再只显示“0 errors”。
+
+可通过容器环境变量调整日志间隔和异步请求超时（单位为秒，必须大于零）：
+
+| 环境变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `PROGRESS_INTERVAL` | `15` | 扫描进度日志间隔 |
+| `CONNECT_TIMEOUT` | `15` | 单次请求连接超时 |
+| `READ_TIMEOUT` | `60` | 单次请求连续没有收到数据的超时 |
+| `REQUEST_TIMEOUT` | `300` | 单次请求总超时，包含响应读取 |
+
+镜像探测设置 15 秒超时，远端清单读取设置 30 秒的 socket 超时。
+这些设置限制单次请求的等待时间，不限制整个同步任务的总时长。
 
 ## 发布自用镜像到 GitHub Packages
 
